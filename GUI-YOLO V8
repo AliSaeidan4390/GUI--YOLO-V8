@@ -1,0 +1,302 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Aug 30 11:27:23 2025
+
+@author: Ali.saeidan
+"""
+
+# yolo_video_gui.py
+# GUI to load a video and run YOLOv8 detection (Detect button).
+# Features:
+#  - Open video
+#  - Select YOLOv8 model (dropdown or browse .pt)
+#  - Confidence slider + image size slider
+#  - Detect/Stop buttons (runs on a background thread)
+#  - Live preview in the window
+#  - Optional "Save annotated video" checkbox
+
+import os
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
+
+import cv2
+from PIL import Image, ImageTk
+from ultralytics import YOLO
+
+class YoloVideoApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Thermal Vision Research")
+        self.geometry("1100x720")
+        ctk.set_appearance_mode("System")
+        ctk.set_default_color_theme("blue")
+
+        # State
+        self.video_path = None
+        self.model_path = None
+        self.model = None
+        self.cap = None
+        self.writer = None
+        self.running = False
+        self.thread = None
+
+        # ---------- Layout ----------
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # Toolbar
+        bar = ctk.CTkFrame(self)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8,4))
+        bar.grid_columnconfigure(8, weight=1)
+
+        self.btn_open = ctk.CTkButton(bar, text="Open Video", command=self.open_video)
+        self.btn_open.grid(row=0, column=0, padx=5, pady=6)
+
+        self.model_choice = ctk.CTkComboBox(
+            bar, values=["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "Browse..."],
+            width=160, state="readonly"
+        )
+        self.model_choice.set("yolov8n.pt")
+        self.model_choice.grid(row=0, column=1, padx=5)
+
+        self.btn_load_model = ctk.CTkButton(bar, text="Load Model", command=self.load_model, width=110)
+        self.btn_load_model.grid(row=0, column=2, padx=5)
+
+        self.chk_save_var = tk.BooleanVar(value=False)
+        self.chk_save = ctk.CTkCheckBox(bar, text="Save annotated video", variable=self.chk_save_var)
+        self.chk_save.grid(row=0, column=3, padx=10)
+
+        self.btn_detect = ctk.CTkButton(bar, text="Detect", fg_color="#2a9d8f", command=self.start_detection, width=90)
+        self.btn_detect.grid(row=0, column=4, padx=(10,5))
+
+        self.btn_stop = ctk.CTkButton(bar, text="Stop", fg_color="#e76f51", command=self.stop_detection, width=90)
+        self.btn_stop.grid(row=0, column=5, padx=5)
+
+        self.lbl_status = ctk.CTkLabel(bar, text="Ready")
+        self.lbl_status.grid(row=0, column=7, padx=10, sticky="e")
+
+        # Controls (left)
+        left = ctk.CTkFrame(self)
+        left.grid(row=1, column=0, sticky="nsw", padx=8, pady=8)
+        left.grid_rowconfigure(99, weight=1)
+
+        ctk.CTkLabel(left, text="Detection Settings", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=6, pady=(6,8))
+
+        # Confidence
+        self.var_conf = tk.DoubleVar(value=0.5)
+        ctk.CTkLabel(left, text="Confidence").grid(row=1, column=0, sticky="w", padx=6)
+        self.sld_conf = ctk.CTkSlider(left, from_=0.1, to=0.9, number_of_steps=80, variable=self.var_conf)
+        self.sld_conf.grid(row=2, column=0, sticky="ew", padx=6, pady=(0,10))
+
+        # Image size
+        self.var_imgsz = tk.IntVar(value=640)
+        ctk.CTkLabel(left, text="Image size (pixels)").grid(row=3, column=0, sticky="w", padx=6)
+        self.sld_imgsz = ctk.CTkSlider(left, from_=320, to=1280, number_of_steps=96,
+                                       command=lambda v: self.lbl_imgsz.configure(text=str(int(float(v)))))
+        self.sld_imgsz.set(self.var_imgsz.get())
+        self.sld_imgsz.grid(row=4, column=0, sticky="ew", padx=6, pady=(0,4))
+        self.lbl_imgsz = ctk.CTkLabel(left, text=str(self.var_imgsz.get()))
+        self.lbl_imgsz.grid(row=5, column=0, sticky="w", padx=6, pady=(0,14))
+
+        # Canvas (right)
+        right = ctk.CTkFrame(self, corner_radius=8)
+        right.grid(row=1, column=1, sticky="nsew", padx=8, pady=8)
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(right, bg="#111111", highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        # For drawing
+        self.tk_frame = None
+
+        # Resize update
+        self.canvas.bind("<Configure>", lambda e: self._redraw_last())
+
+    # ----- Actions -----
+    def open_video(self):
+        path = filedialog.askopenfilename(
+            title="Open video",
+            filetypes=[("Video files", "*.mp4;*.avi;*.mov;*.mkv;*.m4v;*.wmv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        self.video_path = path
+        self._set_status(f"Video: {os.path.basename(path)}")
+        # Show first frame as preview
+        cap = cv2.VideoCapture(path)
+        ok, frame = cap.read()
+        cap.release()
+        if ok:
+            self._show_frame(frame)
+        else:
+            messagebox.showerror("Error", "Could not read the video.")
+
+    def load_model(self):
+        choice = self.model_choice.get()
+        if choice == "Browse...":
+            mp = filedialog.askopenfilename(
+                title="Select YOLOv8 .pt model",
+                filetypes=[("YOLO model", "*.pt"), ("All files", "*.*")]
+            )
+            if not mp:
+                return
+            self.model_path = mp
+        else:
+            self.model_path = choice  # e.g., "yolov8n.pt" (auto-downloaded by ultralytics)
+
+        try:
+            self._set_status("Loading model...")
+            self.model = YOLO(self.model_path)
+            # self.model.to('cuda')         # if available
+            # self.model.fuse()             # small speedup
+            # self.model.predict(0)         # warm-up call (optional)
+            self._set_status(f"Model loaded: {os.path.basename(self.model_path)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load model:\n{e}")
+            self._set_status("Ready")
+
+    def start_detection(self):
+        if not self.video_path:
+            messagebox.showinfo("Info", "Please open a video first.")
+            return
+        if self.model is None:
+            # Try auto-load default if user forgot
+            try:
+                self._set_status("Loading default model (yolov8n.pt)...")
+                self.model = YOLO("yolov8n.pt")
+            except Exception as e:
+                messagebox.showerror("Error", f"Load a model first:\n{e}")
+                self._set_status("Ready")
+                return
+
+        # Get current sliders
+        self.var_imgsz.set(int(float(self.sld_imgsz.get())))
+        imgsz = self.var_imgsz.get()
+        conf = float(self.var_conf.get())
+
+        # Output video if requested
+        out_path = None
+        self.writer = None
+        if self.chk_save_var.get():
+            base = os.path.splitext(os.path.basename(self.video_path))[0]
+            init_name = f"{base}_yolo8.mp4"
+            out_path = filedialog.asksaveasfilename(
+                title="Save annotated video as",
+                defaultextension=".mp4",
+                initialfile=init_name,
+                filetypes=[("MP4", "*.mp4"), ("AVI", "*.avi"), ("All files", "*.*")]
+            )
+            if not out_path:
+                out_path = None
+
+        # Spawn worker thread
+        self.running = True
+        self.thread = threading.Thread(
+            target=self._detect_worker, args=(self.video_path, imgsz, conf, out_path), daemon=True
+        )
+        self.thread.start()
+        self._set_status("Detecting...")
+
+    def stop_detection(self):
+        self.running = False
+        self._set_status("Stopping...")
+
+    # ----- Worker -----
+    def _detect_worker(self, video_path, imgsz, conf, out_path):
+        try:
+            cap = cv2.VideoCapture(video_path)
+            self.cap = cap
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0 or fps > 240:
+                fps = 30
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            # Prepare writer if needed
+            if out_path is not None:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v") if out_path.lower().endswith(".mp4") else cv2.VideoWriter_fourcc(*"XVID")
+                self.writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            processed = 0
+
+            while self.running:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+
+                # Run YOLO on the frame
+                results = self.model.predict(frame, imgsz=imgsz, conf=conf, verbose=False)
+                annotated = results[0].plot()  # returns BGR image with boxes
+
+                # Show in GUI
+                self._show_frame(annotated)
+
+                # Write to file if requested
+                if self.writer is not None:
+                    self.writer.write(annotated)
+
+                processed += 1
+                if frame_count > 0 and processed % 10 == 0:
+                    pct = int(processed / frame_count * 100)
+                    self._set_status(f"Detecting... {pct}%")
+
+            # Cleanup
+            cap.release()
+            self.cap = None
+            if self.writer is not None:
+                self.writer.release()
+                self.writer = None
+
+            if self.running:
+                self._set_status("Done.")
+            else:
+                self._set_status("Stopped.")
+        except Exception as e:
+            self._set_status("Error")
+            messagebox.showerror("Error", f"Detection error:\n{e}")
+        finally:
+            self.running = False
+
+    # ----- UI helpers -----
+    def _show_frame(self, frame_bgr):
+        """Draw a BGR frame on the Tk canvas (fit to window, keep AR)."""
+        # Convert to RGB for Tk
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            self.after(30, lambda: self._show_frame(frame_bgr))
+            return
+
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih)
+        disp_w = max(1, int(iw * scale))
+        disp_h = max(1, int(ih * scale))
+        img_disp = img.resize((disp_w, disp_h), Image.LANCZOS)
+
+        self.tk_frame = ImageTk.PhotoImage(img_disp)
+        self.canvas.delete("all")
+        x0 = (cw - disp_w) // 2
+        y0 = (ch - disp_h) // 2
+        self.canvas.create_image(x0, y0, anchor="nw", image=self.tk_frame)
+
+    def _redraw_last(self):
+        # No stored last frame; redraw will happen on next frame arrival
+        pass
+
+    def _set_status(self, text):
+        self.lbl_status.configure(text=text)
+        self.update_idletasks()
+
+def main():
+    app = YoloVideoApp()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
